@@ -1,0 +1,351 @@
+//============================================================
+// Den giao thong + WiFi (ESP8266 transparent) - PIC18F4550
+// Compiler: MikroC PRO for PIC
+//
+// Logic giong pic.c (UART), nhung UART noi ESP8266 -> TCP.
+// Giao thuc lenh 1 byte + packet T giong pic.c de GUI khong doi.
+//
+// Phan cung giong pic.c:
+//   RE0=GREEN, RE1=YELLOW, RE2=RED
+//   PORTD = 7-seg common anode
+//   RB0=BTN_B, RB1=BTN_O, RB2=BTN_P
+//   RC6=TX, RC7=RX  <-> ESP8266
+//   RD7 = reset ESP8266 (theo wifi.c)
+//
+// Cau hinh WiFi: sua trong ESP8266_init()
+//============================================================
+
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include "esp8266.h"
+
+#define MODE_AUTO 0
+#define MODE_B    1
+#define MODE_O    2
+#define MODE_P    3
+
+#define CTRL_MANUAL 0
+#define CTRL_GUI    1
+
+unsigned char ControlMode = CTRL_MANUAL;
+unsigned char Mode        = MODE_AUTO;
+unsigned char DayNight    = 0;
+
+unsigned char timeRed    = 5;
+unsigned char timeYellow = 3;
+unsigned char timeGreen  = 8;
+
+unsigned char timeUpdated = 0;
+
+#define RED    LATE2_bit
+#define YELLOW LATE1_bit
+#define GREEN  LATE0_bit
+
+#define BTN_B  RB0_bit
+#define BTN_O  RB1_bit
+#define BTN_P  RB2_bit
+
+const unsigned char seg7[11] = {
+    0xC0, 0xF9, 0xA4, 0xB0, 0x99,
+    0x92, 0x82, 0xF8, 0x80, 0x90,
+    0xFF
+};
+
+void Display7Seg(unsigned char num) {
+    if (num > 10) num = 10;
+    PORTD = seg7[num];
+}
+
+//============================================================
+// WiFi / ESP8266 (tham khao wifi.c)
+//============================================================
+
+void ESP8266_init(void) {
+    esp8266_restart();
+
+    esp8266_echoCmds(0);
+
+    esp8266_isStarted();
+
+    esp8266_mode(ESP8266_STATION);
+
+    // Giong wifi.c â€” doi SSID / mat khau / IP server neu can
+    esp8266_connect("1911", "0839247169");
+
+    esp8266_start_TCP("192.168.0.123", 8000);
+
+    esp8266_trans_mode(ESP8266_TRANS_PASS);
+
+    esp8266_send();
+}
+
+//============================================================
+// UART - giong pic.c (byte qua WiFi transparent)
+//============================================================
+
+unsigned char t_idx = 0;
+unsigned char t_buf[3];
+
+void check_UART(void) {
+    unsigned char c;
+
+    if (RCSTA.OERR) {
+        RCSTA.CREN = 0;
+        RCSTA.CREN = 1;
+    }
+
+    while (UART1_Data_Ready()) {
+        c = UART1_Read();
+
+        if (t_idx > 0) {
+            if (t_idx >= 1 && t_idx <= 3) {
+                if (c >= '0' && c <= '9') {
+                    t_buf[t_idx - 1] = c - '0';
+                    t_idx++;
+                } else {
+                    t_idx = 0;
+                }
+                continue;
+            }
+            if (t_idx == 4) {
+                timeRed    = t_buf[0];
+                timeYellow = t_buf[1];
+                timeGreen  = t_buf[2];
+                switch (c) {
+                    case 'A': Mode = MODE_AUTO; break;
+                    case 'B': Mode = MODE_B;    break;
+                    case 'O': Mode = MODE_O;    break;
+                    case 'P': Mode = MODE_P;    break;
+                }
+                timeUpdated = 1;
+                UART1_Write('X');
+                t_idx = 0;
+                continue;
+            }
+        }
+
+        switch (c) {
+            case 'T':
+                t_idx = 1;
+                break;
+
+            case 'M':
+                ControlMode = CTRL_MANUAL;
+                break;
+
+            case 'G':
+                ControlMode = CTRL_GUI;
+                break;
+
+            case 'A':
+                if (ControlMode == CTRL_GUI) Mode = MODE_AUTO;
+                break;
+
+            case 'B':
+                if (ControlMode == CTRL_GUI) Mode = MODE_B;
+                break;
+
+            case 'O':
+                if (ControlMode == CTRL_GUI) Mode = MODE_O;
+                break;
+
+            case 'P':
+                if (ControlMode == CTRL_GUI) Mode = MODE_P;
+                break;
+
+            case 'D':
+                if (Mode == MODE_P) DayNight = 0;
+                break;
+
+            case 'N':
+                if (Mode == MODE_P) DayNight = 1;
+                break;
+        }
+    }
+}
+
+void check_Button(void) {
+    if (ControlMode != CTRL_MANUAL) return;
+
+    if (BTN_B == 0) {
+        Delay_ms(20);
+        if (BTN_B == 0) {
+            Mode = MODE_B;
+            UART1_Write('B');
+            while (BTN_B == 0);
+        }
+    }
+    if (BTN_O == 0) {
+        Delay_ms(20);
+        if (BTN_O == 0) {
+            Mode = MODE_O;
+            UART1_Write('O');
+            while (BTN_O == 0);
+        }
+    }
+    if (BTN_P == 0) {
+        Delay_ms(20);
+        if (BTN_P == 0) {
+            Mode = MODE_P;
+            UART1_Write('P');
+            while (BTN_P == 0);
+        }
+    }
+}
+
+void Check_Event(void) {
+    check_UART();
+    check_Button();
+}
+
+void MyDelay(unsigned int ms) {
+    unsigned int k;
+    unsigned int steps = ms / 10;
+    for (k = 0; k < steps; k++) {
+        Delay_ms(10);
+        Check_Event();
+        if (timeUpdated) return;
+    }
+}
+
+void main(void) {
+    signed char i;
+
+    ADCON1 = 0x0F;
+    CMCON  = 0x07;
+
+    TRISB = 0x07;
+    PORTB = 0xFF;
+
+    TRISE = 0x00;
+    LATE  = 0x00;
+
+    TRISD = 0x00;
+    PORTD = 0xFF;
+
+    TRISD7_bit = 0;
+
+    TRISC6_bit = 0;
+    TRISC7_bit = 1;
+
+    UART1_Init(9600);
+    Delay_ms(100);
+
+    RD7_bit = 0;
+    Delay_ms(100);
+    RD7_bit = 1;
+    Delay_ms(1000);
+
+    ESP8266_init();
+
+    Delay_ms(200);
+
+    while (1) {
+        Check_Event();
+
+        if (timeUpdated) {
+            timeUpdated = 0;
+            continue;
+        }
+
+        if (Mode == MODE_B) {
+            RED = 1; YELLOW = 0; GREEN = 0;
+            Display7Seg(10);
+            UART1_Write('R');
+            MyDelay(1000);
+            continue;
+        }
+
+        if (Mode == MODE_O) {
+            RED = 0; GREEN = 0;
+            Display7Seg(10);
+            YELLOW = 1;
+            UART1_Write('Y');
+            MyDelay(500);
+            if (timeUpdated || Mode != MODE_O) continue;
+            YELLOW = 0;
+            UART1_Write('F');
+            MyDelay(500);
+            continue;
+        }
+
+        if (Mode == MODE_P) {
+            if (DayNight == 1) {
+                RED = 0; GREEN = 0;
+                Display7Seg(10);
+                YELLOW = 1;
+                UART1_Write('Y');
+                MyDelay(500);
+                if (timeUpdated || Mode != MODE_P) continue;
+                YELLOW = 0;
+                UART1_Write('F');
+                MyDelay(500);
+                continue;
+            }
+
+            RED = 1; YELLOW = 0; GREEN = 0;
+            UART1_Write('R');
+            for (i = timeRed; i >= 1; i--) {
+                Display7Seg(i);
+                UART1_Write('0' + i);
+                MyDelay(1000);
+                if (timeUpdated || Mode != MODE_P || DayNight != 0) break;
+            }
+            if (DayNight == 1) Display7Seg(10);
+            if (timeUpdated || Mode != MODE_P || DayNight != 0) continue;
+
+            RED = 0; YELLOW = 0; GREEN = 1;
+            UART1_Write('G');
+            for (i = timeGreen; i >= 1; i--) {
+                Display7Seg(i);
+                UART1_Write('0' + i);
+                MyDelay(1000);
+                if (timeUpdated || Mode != MODE_P || DayNight != 0) break;
+            }
+            if (DayNight == 1) Display7Seg(10);
+            if (timeUpdated || Mode != MODE_P || DayNight != 0) continue;
+
+            RED = 0; YELLOW = 1; GREEN = 0;
+            UART1_Write('Y');
+            for (i = timeYellow; i >= 1; i--) {
+                Display7Seg(i);
+                UART1_Write('0' + i);
+                MyDelay(1000);
+                if (timeUpdated || Mode != MODE_P || DayNight != 0) break;
+            }
+            if (DayNight == 1) Display7Seg(10);
+            continue;
+        }
+
+        RED = 1; YELLOW = 0; GREEN = 0;
+        UART1_Write('R');
+        for (i = timeRed; i >= 1; i--) {
+            Display7Seg(i);
+            UART1_Write('0' + i);
+            MyDelay(1000);
+            if (timeUpdated || Mode != MODE_AUTO) break;
+        }
+        if (timeUpdated || Mode != MODE_AUTO) continue;
+
+        RED = 0; YELLOW = 0; GREEN = 1;
+        UART1_Write('G');
+        for (i = timeGreen; i >= 1; i--) {
+            Display7Seg(i);
+            UART1_Write('0' + i);
+            MyDelay(1000);
+            if (timeUpdated || Mode != MODE_AUTO) break;
+        }
+        if (timeUpdated || Mode != MODE_AUTO) continue;
+
+        RED = 0; YELLOW = 1; GREEN = 0;
+        UART1_Write('Y');
+        for (i = timeYellow; i >= 1; i--) {
+            Display7Seg(i);
+            UART1_Write('0' + i);
+            MyDelay(1000);
+            if (timeUpdated || Mode != MODE_AUTO) break;
+        }
+    }
+}

@@ -1,0 +1,340 @@
+  //============================================================
+  // Traffic Light + UART - PIC18F4550 @ 20MHz
+  // Compiler: MikroC PRO for PIC
+  //
+  // LOGIC KHOI DONG:
+  //   - PIC cap nguon -> tu chay AUTO ngay (do 5s, xanh 8s, vang 3s)
+  //   - Nut vat ly co the bam de doi mode (mac dinh MANUAL)
+  //   - Khi GUI connect va chon "GUI" -> khoa nut vat ly
+  //   - Khi GUI chon "Manual" -> nut vat ly hoat dong, GUI khoa
+  //
+  // Ket noi phan cung:
+  //   RE0=GREEN, RE1=YELLOW, RE2=RED
+  //   PORTD = 7-seg common anode
+  //   RB0=BTN_B, RB1=BTN_O, RB2=BTN_P
+  //   RC6=TX, RC7=RX
+  //============================================================
+
+  #define MODE_AUTO 0
+  #define MODE_B    1
+  #define MODE_O    2
+  #define MODE_P    3
+
+  // Che do dieu khien
+  // CTRL_MANUAL: nut vat ly hoat dong (mac dinh khi cap nguon)
+  // CTRL_GUI   : nut GUI tren may tinh hoat dong, nut vat ly bi khoa
+  #define CTRL_MANUAL 0
+  #define CTRL_GUI    1
+
+  // MAC DINH: CTRL_MANUAL va MODE_AUTO -> PIC tu chay ngay khi cap nguon
+  unsigned char ControlMode = CTRL_MANUAL;
+  unsigned char Mode        = MODE_AUTO;
+  unsigned char DayNight    = 0;
+
+  unsigned char timeRed    = 5;
+  unsigned char timeYellow = 3;
+  unsigned char timeGreen  = 8;
+
+  unsigned char timeUpdated = 0;
+
+  #define RED    LATE2_bit
+  #define YELLOW LATE1_bit
+  #define GREEN  LATE0_bit
+
+  #define BTN_B  RB0_bit
+  #define BTN_O  RB1_bit
+  #define BTN_P  RB2_bit
+
+  // 7-seg common anode
+  const unsigned char seg7[11] = {
+      0xC0, 0xF9, 0xA4, 0xB0, 0x99,
+      0x92, 0x82, 0xF8, 0x80, 0x90,
+      0xFF   // index 10 = tat
+  };
+
+  void Display7Seg(unsigned char num) {
+      if (num > 10) num = 10;
+      PORTD = seg7[num];
+  }
+
+  // =========================================================
+  //  UART - State machine tach rieng packet T va lenh 1 byte
+  // =========================================================
+  unsigned char t_idx = 0;
+  unsigned char t_buf[3];   // luu r, y, g
+
+  void check_UART() {
+      unsigned char c;
+
+      // Fix loi Overrun - MikroC
+      if (RCSTA.OERR) {
+          RCSTA.CREN = 0;
+          RCSTA.CREN = 1;
+      }
+
+      while (UART1_Data_Ready()) {
+          c = UART1_Read();
+
+          // --- Dang nhan payload packet T[r][y][g][mode] ---
+          if (t_idx > 0) {
+              if (t_idx <= 3) {
+                  if (c >= '1' && c <= '9') {
+                      t_buf[t_idx - 1] = c - '0';
+                      t_idx++;
+                  } else {
+                      t_idx = 0;   // Sai format, huy packet
+                  }
+                  continue;
+              }
+              if (t_idx == 4) {
+                  // Byte cuoi: mode
+                  timeRed    = t_buf[0];
+                  timeYellow = t_buf[1];
+                  timeGreen  = t_buf[2];
+                  switch (c) {
+                      case 'A': Mode = MODE_AUTO; break;
+                      case 'B': Mode = MODE_B;    break;
+                      case 'O': Mode = MODE_O;    break;
+                      case 'P': Mode = MODE_P;    break;
+                  }
+                  timeUpdated = 1;
+                  UART1_Write('X');   // Xac nhan nhan thanh cong
+                  t_idx = 0;
+                  continue;
+              }
+          }
+
+          // --- Lenh 1 byte ---
+          switch (c) {
+              case 'T':
+                  // Bat dau nhan packet set time
+                  t_idx = 1;
+                  break;
+
+              case 'M':
+                  // GUI chon MANUAL -> nut vat ly hoat dong
+                  ControlMode = CTRL_MANUAL;
+                  break;
+
+              case 'G':
+                  // GUI chon GUI mode -> khoa nut vat ly
+                  ControlMode = CTRL_GUI;
+                  break;
+
+              case 'A':
+                  // Chi nhan lenh A khi dang o GUI mode
+                  if (ControlMode == CTRL_GUI) Mode = MODE_AUTO;
+                  break;
+
+              case 'B':
+                  if (ControlMode == CTRL_GUI) Mode = MODE_B;
+                  break;
+
+              case 'O':
+                  if (ControlMode == CTRL_GUI) Mode = MODE_O;
+                  break;
+
+              case 'P':
+                  if (ControlMode == CTRL_GUI) Mode = MODE_P;
+                  break;
+
+              case 'D':
+                  // Ban ngay (5h-22h)
+                  if (Mode == MODE_P) DayNight = 0;
+                  break;
+
+              case 'N':
+                  // Ban dem (22h-5h)
+                  if (Mode == MODE_P) DayNight = 1;
+                  break;
+          }
+      }
+  }
+
+  void check_Button() {
+      // Nut vat ly chi hoat dong khi CTRL_MANUAL
+      if (ControlMode != CTRL_MANUAL) return;
+
+      if (BTN_B == 0) {
+          Delay_ms(20);
+          if (BTN_B == 0) {
+              Mode = MODE_B;
+              UART1_Write('B');
+              while (BTN_B == 0);
+          }
+      }
+      if (BTN_O == 0) {
+          Delay_ms(20);
+          if (BTN_O == 0) {
+              Mode = MODE_O;
+              UART1_Write('O');
+              while (BTN_O == 0);
+          }
+      }
+      if (BTN_P == 0) {
+          Delay_ms(20);
+          if (BTN_P == 0) {
+              Mode = MODE_P;
+              UART1_Write('P');
+              while (BTN_P == 0);
+          }
+      }
+  }
+
+  void Check_Event() {
+      check_UART();
+      check_Button();
+  }
+
+  // Delay thong minh: chia nho 10ms, kiem tra UART/Button lien tuc
+  // Thoat som neu co lenh moi (timeUpdated=1 hoac Mode thay doi)
+  void MyDelay(unsigned int ms) {
+      unsigned int k;
+      unsigned int steps = ms / 10;
+      for (k = 0; k < steps; k++) {
+          Delay_ms(10);
+          Check_Event();
+          if (timeUpdated) return;
+      }
+  }
+
+  void main() {
+      signed char i;
+
+      // Cau hinh port
+      ADCON1 = 0x0F;   // Tat ADC analog
+      CMCON  = 0x07;   // Tat Comparator
+
+      TRISB = 0x07;    // RB0,RB1,RB2 = input (nut nhan)
+      PORTB = 0xFF;    // Kich hoat keo len
+
+      TRISE = 0x00;    // PORTE = output (LED)
+      LATE  = 0x00;    // Tat het LED
+
+      TRISD = 0x00;    // PORTD = output (7-seg)
+      PORTD = 0xFF;    // Tat 7-seg (common anode)
+
+      UART1_Init(9600);
+      Delay_ms(200);
+
+      // =====================================================
+      // VONG LAP CHINH
+      // Mac dinh: CTRL_MANUAL + MODE_AUTO -> chay ngay khi cap nguon
+      // =====================================================
+      while (1) {
+          Check_Event();
+
+          // Neu vua nhan set time -> reset ve dau chu ky ap dung ngay
+          if (timeUpdated) {
+              timeUpdated = 0;
+              continue;
+          }
+
+          // ============= MODE B: Do lien tuc =============
+          if (Mode == MODE_B) {
+              RED = 1; YELLOW = 0; GREEN = 0;
+              Display7Seg(10);        // Tat 7-seg
+              UART1_Write('R');
+              MyDelay(1000);
+              continue;
+          }
+
+          // ============= MODE O: Vang nhap nhay =============
+          if (Mode == MODE_O) {
+              RED = 0; GREEN = 0;
+              Display7Seg(10);        // Tat 7-seg
+              YELLOW = 1;
+              UART1_Write('Y');
+              MyDelay(500);
+              if (timeUpdated || Mode != MODE_O) continue;
+              YELLOW = 0;
+              UART1_Write('F');
+              MyDelay(500);
+              continue;
+          }
+
+          // ============= MODE P: Theo gio =============
+          if (Mode == MODE_P) {
+              // Ban dem: nhap nhay vang, tat 7-seg
+              if (DayNight == 1) {
+                  RED = 0; GREEN = 0;
+                  Display7Seg(10);
+                  YELLOW = 1;
+                  UART1_Write('Y');
+                  MyDelay(500);
+                  if (timeUpdated || Mode != MODE_P) continue;
+                  YELLOW = 0;
+                  UART1_Write('F');
+                  MyDelay(500);
+                  continue;
+              }
+
+              // Ban ngay: DO
+              RED = 1; YELLOW = 0; GREEN = 0;
+              UART1_Write('R');
+              for (i = timeRed; i >= 1; i--) {
+                  Display7Seg(i);
+                  UART1_Write('0' + i);
+                  MyDelay(1000);
+                  if (timeUpdated || Mode != MODE_P || DayNight != 0) break;
+              }
+              if (DayNight == 1) Display7Seg(10);
+              if (timeUpdated || Mode != MODE_P || DayNight != 0) continue;
+
+              // Ban ngay: XANH
+              RED = 0; YELLOW = 0; GREEN = 1;
+              UART1_Write('G');
+              for (i = timeGreen; i >= 1; i--) {
+                  Display7Seg(i);
+                  UART1_Write('0' + i);
+                  MyDelay(1000);
+                  if (timeUpdated || Mode != MODE_P || DayNight != 0) break;
+              }
+              if (DayNight == 1) Display7Seg(10);
+              if (timeUpdated || Mode != MODE_P || DayNight != 0) continue;
+
+              // Ban ngay: VANG
+              RED = 0; YELLOW = 1; GREEN = 0;
+              UART1_Write('Y');
+              for (i = timeYellow; i >= 1; i--) {
+                  Display7Seg(i);
+                  UART1_Write('0' + i);
+                  MyDelay(1000);
+                  if (timeUpdated || Mode != MODE_P || DayNight != 0) break;
+              }
+              if (DayNight == 1) Display7Seg(10);
+              continue;
+          }
+
+          // ============= MODE AUTO (mac dinh) =============
+          // Chay ngay khi cap nguon: Do 5s -> Xanh 8s -> Vang 3s
+          RED = 1; YELLOW = 0; GREEN = 0;
+          UART1_Write('R');
+          for (i = timeRed; i >= 1; i--) {
+              Display7Seg(i);
+              UART1_Write('0' + i);
+              MyDelay(1000);
+              if (timeUpdated || Mode != MODE_AUTO) break;
+          }
+          if (timeUpdated || Mode != MODE_AUTO) continue;
+
+          RED = 0; YELLOW = 0; GREEN = 1;
+          UART1_Write('G');
+          for (i = timeGreen; i >= 1; i--) {
+              Display7Seg(i);
+              UART1_Write('0' + i);
+              MyDelay(1000);
+              if (timeUpdated || Mode != MODE_AUTO) break;
+          }
+          if (timeUpdated || Mode != MODE_AUTO) continue;
+
+          RED = 0; YELLOW = 1; GREEN = 0;
+          UART1_Write('Y');
+          for (i = timeYellow; i >= 1; i--) {
+              Display7Seg(i);
+              UART1_Write('0' + i);
+              MyDelay(1000);
+              if (timeUpdated || Mode != MODE_AUTO) break;
+          }
+      }
+  }

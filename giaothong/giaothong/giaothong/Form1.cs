@@ -1,0 +1,676 @@
+using System;
+using System.Drawing;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+
+// ================================================================
+//  TRAFFIC LIGHT CONTROL — C# ETHERNET (TCP Server)
+//  PIC van dung UART (code UART khong doi)
+//  Chi doi C# tu SerialPort sang TCP Socket
+//
+//  FORM HIEN TAI CO:
+//    label "COM port" + 4 textbox: textBox_IP1/IP2/IP3/IP4
+//    label "textBox_Port" + textBox_Port
+//    button Connect, button Disconnect (Disconnec), button Status (= ldldata)
+//    pictureBox_Light, pictureBox_Number
+//    checkBox_Manual, checkBox_GUI (khong co groupBox_GUIMode)
+//    btn_B (MODE1-DO), btn_O (MODE2-VANG), btn_P (MODE3 AUTO)
+//    numRed, numYellow, numGreen
+//    button Apply (button1), button RESET (button2/lblStatus)
+//    label "Date and Time" (label_Time), label "Current Mode" (label_Mode)
+//    timerAuto, timeCLock
+// ================================================================
+
+namespace traffic
+{
+    public partial class lable_reset : Form
+    {
+        // ---- ETHERNET (thay SerialPort) ----
+        Socket server;
+        Socket client;
+        byte[] datasend = new byte[1];
+        byte[] datareceive = new byte[256];
+        bool isConnected = false;
+
+        // ---- STATE ----
+        string currentMode = "";
+        string lastDayNight = "";
+        bool isSending = false;
+        bool suppressEvt = false;
+
+        public lable_reset()
+        {
+            InitializeComponent();
+            this.FormClosing += Form1_FormClosing;
+        }
+
+        // ============================================================
+        //  FORM LOAD
+        // ============================================================
+        private void Form1_Load(object sender, EventArgs e)
+        {
+            textBox_IP1.Text = "192";
+            textBox_IP2.Text = "168";
+            textBox_IP3.Text = "0";
+            textBox_IP4.Text = "123";
+            textBox_Port.Text = "8000";
+
+            numRed.Minimum = 1; numRed.Maximum = 9; numRed.Value = 5;
+            numYellow.Minimum = 1; numYellow.Maximum = 9; numYellow.Value = 3;
+            numGreen.Minimum = 1; numGreen.Maximum = 9; numGreen.Value = 8;
+            numRed.ReadOnly = false;
+            numYellow.ReadOnly = false;
+            numGreen.ReadOnly = false;
+
+            timerAuto.Interval = 1000;
+            timeCLock.Interval = 5000;
+            timerAuto.Start();
+
+            SetUIConnected(false);
+        }
+
+        // ============================================================
+        //  GUI 1 KY TU QUA SOCKET (thay serialPort1.Write)
+        // ============================================================
+        private void SendChar(char c)
+        {
+            if (!isConnected || client == null) return;
+            try
+            {
+                datasend = Encoding.ASCII.GetBytes(new char[] { c });
+                client.Send(datasend, datasend.Length, SocketFlags.None);
+            }
+            catch { }
+        }
+
+        // ============================================================
+        //  GUI TIMING: "T" + r + y + g + mode (5 byte ASCII)
+        //  Vi du: R=5,Y=3,G=8,AUTO -> gui T,5,3,8,A
+        //  Tung byte delay 20ms de PIC kip xu ly
+        // ============================================================
+        private async Task SendTiming(byte r, byte y, byte g, string mode)
+        {
+            if (!isConnected || client == null) return;
+            isSending = true;
+            timeCLock.Stop();
+            try
+            {
+                byte[] pkt = {
+                    (byte)'T',
+                    (byte)('0' + r),
+                    (byte)('0' + y),
+                    (byte)('0' + g),
+                    (byte)mode[0]
+                };
+                for (int i = 0; i < pkt.Length; i++)
+                {
+                    client.Send(new byte[] { pkt[i] }, 1, SocketFlags.None);
+                    await Task.Delay(50);
+                }
+                await Task.Delay(200);  // cho PIC gui 'X' xac nhan
+                if (mode == "P") { lastDayNight = ""; SendDayNight(); timeCLock.Start(); }
+            }
+            catch (Exception ex) { MessageBox.Show("Lỗi: " + ex.Message); }
+            finally { isSending = false; }
+        }
+
+        // ============================================================
+        //  CONNECT: Tao thread lang nghe (Server mode)
+        //  Dung IPAddress.Any de nhan ket noi tu PIC qua bat ky interface
+        // ============================================================
+        private void button_Connect_Click(object sender, EventArgs e)
+        {
+            button_Connect.Enabled = false;
+            textBox_IP1.Enabled = textBox_IP2.Enabled = false;
+            textBox_IP3.Enabled = textBox_IP4.Enabled = false;
+            textBox_Port.Enabled = false;
+
+            ldldata.Text = "Waiting...";
+            ldldata.BackColor = Color.Yellow;
+
+            Thread t = new Thread(Endpoint_Thread);
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        // ============================================================
+        //  ENDPOINT THREAD - theo style code thay
+        //  Bind tren IPAddress.Any (khong phai IP cu the)
+        //  de nhan ket noi tu PIC bat ke IP interface nao
+        // ============================================================
+        void Endpoint_Thread()
+        {
+            try
+            {
+                int port = int.Parse(textBox_Port.Text.Trim());
+
+                // DUNG IPAddress.Any, khong phai IPAddress.Parse(ip)
+                // IPAddress.Any = 0.0.0.0 = nhan tu tat ca interface
+                server = new Socket(AddressFamily.InterNetwork,
+                                    SocketType.Stream, ProtocolType.Tcp);
+                server.Bind(new IPEndPoint(IPAddress.Any, port));
+                server.Listen(10);
+
+                // Block o day cho den khi PIC ket noi
+                client = server.Accept();
+                isConnected = true;
+
+                // Bat dau nhan du lieu truoc de kip doc gi
+                Thread recv = new Thread(Receive);
+                recv.IsBackground = true;
+                recv.Start();
+
+                this.Invoke((MethodInvoker)async delegate
+                {
+                    ldldata.Text = "Connected: " + client.RemoteEndPoint;
+                    ldldata.BackColor = Color.Lime;
+                    
+                    button_Connect.Enabled = false;
+                    button_Disconnect.Enabled = true;
+
+                    // Mo nhom control
+                    SetControlsEnabled(true);
+
+                    // Chay mac dinh Mode 0 (Auto) khi vua ket noi
+                    currentMode = "A";
+                    numRed.Value = 5;
+                    numYellow.Value = 3;
+                    numGreen.Value = 8;
+                    label_Mode.Text = "AUTO MODE  ·  Khởi tạo (ĐỎ=5s, VÀNG=3s, XANH=8s)";
+                    pictureBox_Light.Image = Properties.Resources.off_1;
+                    pictureBox_Number.Image = null;
+               //     pictureBox_Number2.Image = null;
+
+                    // Gui ngay xuong PIC de no bat dau dem
+                    await SendTiming(5, 3, 8, "A");
+                });
+            }
+            catch (Exception)
+            {
+                this.Invoke(new Action(() =>
+                {
+                    ldldata.Text = "Not connect";
+                    ldldata.BackColor = Color.Red;
+                    button_Connect.Enabled = true;
+                    textBox_IP1.Enabled = textBox_IP2.Enabled = true;
+                    textBox_IP3.Enabled = textBox_IP4.Enabled = true;
+                    textBox_Port.Enabled = true;
+                }));
+            }
+        }
+
+        // ============================================================
+        //  RECEIVE THREAD - nhan du lieu tu PIC
+        //  UART PIC gui: R,G,Y,F,B,O,P,X,'1'..'9'
+        // ============================================================
+        void Receive()
+        {
+            try
+            {
+                while (true)
+                {
+                    int n = client.Receive(datareceive);
+                    if (n <= 0) break;
+                    string s = Encoding.ASCII.GetString(datareceive, 0, n);
+
+                    this.Invoke(new Action(() =>
+                    {
+                        foreach (char c in s)
+                        {
+                            switch (c)
+                            {
+                                case 'R':   // Den Do
+                                    pictureBox_Light.Image = Properties.Resources.r1;
+                                    if (!ShouldShowNum()) pictureBox_Number.Image = null;
+                                    //pictureBox_Number2.Image = null;    
+                                    label_Mode.Text = GetPrefix() + "Đèn ĐỎ";
+                                    break;
+
+                                case 'G':   // Den Xanh
+                                    pictureBox_Light.Image = Properties.Resources.gr1;
+                                    if (!ShouldShowNum()) pictureBox_Number.Image = null;
+                                  //  pictureBox_Number2.Image = null;
+                                    label_Mode.Text = GetPrefix() + "Đèn XANH";
+                                    break;
+
+                                case 'Y':   // Den Vang (AUTO hoac nhap nhay ON)
+                                    pictureBox_Light.Image = Properties.Resources.yl;
+                                    if (currentMode == "O")
+                                    {
+                                        pictureBox_Number.Image = null;
+                                     //   pictureBox_Number2.Image = null;
+                                        label_Mode.Text = "MODE 2 ·Vàng nhấp nháy(ON)";
+                                    }
+                                    else if (currentMode == "P" && IsNight())
+                                    {
+                                        pictureBox_Number.Image = null;
+                                        //pictureBox_Number2.Image = null;
+                                        label_Mode.Text = "MODE 3:Ban đêm·Vàng nhấp nháy(ON)";
+                                    }
+                                    else
+                                        label_Mode.Text = GetPrefix() + "Đèn VÀNG";
+                                    break;
+
+                                case 'F':   // Den Vang tat (nhap nhay OFF)
+                                    pictureBox_Light.Image = Properties.Resources.off_11;
+                                    pictureBox_Number.Image = null;
+                                 //
+                                 //pictureBox_Number2.Image = null;
+                                    break;
+                                    
+                                case 'A':   // Tu dong hoac Mode 0
+                                    currentMode = "A";
+                                    timeCLock.Stop();
+                                    label_Mode.Text = "AUTO  ·  Hoạt động tự động";
+                                    break;
+
+                                case '0':
+                                case '1':
+                                case '2':
+                                case '3':
+                                case '4':
+                                case '5':
+                                case '6':
+                                case '7':
+                                case '8':
+                                case '9':
+                                    if (ShouldShowNum())
+                                        ShowNumber(c - '0');
+                                    break;
+
+                                case 'B':   // Nut B vat ly -> MODE1
+                                    currentMode = "B";
+                                    timeCLock.Stop();
+                                    pictureBox_Light.Image = Properties.Resources.r1;
+                                    pictureBox_Number.Image = null;
+                                  //  pictureBox_Number2.Image = null;
+                                    label_Mode.Text = "MANUAL·Nút B → Đỏliên tục";
+                                    break;
+
+                                case 'O':   // Nut O vat ly -> MODE2
+                                    currentMode = "O";
+                                    timeCLock.Stop();
+                                    pictureBox_Number.Image = null;
+                                      // pictureBox_Number2.Image = null;
+                                    label_Mode.Text = "MANUAL· Nút O → Vàng nhấp nháy";
+                                    break;
+
+                                case 'P':   // Nut P vat ly -> MODE3
+                                    currentMode = "P";
+                                    lastDayNight = "";
+                                    timeCLock.Stop();
+                                    pictureBox_Number.Image = null;
+                                    SendDayNight();
+                                    timeCLock.Interval = 5000;
+                                    timeCLock.Start();
+                                    label_Mode.Text = "MANUAL · Nút P → MODE 3";
+                                    break;
+
+                                case 'X':   // Xac nhan timing
+                                    label_Mode.Text = label_Mode.Text.Replace(" ✓", "") + " ✓";
+                                    break;
+                            }
+                        }
+                    }));
+                }
+            }
+            catch { }
+            finally
+            {
+                isConnected = false;
+                try { client?.Close(); } catch { }
+                this.Invoke(new Action(DoDisconnect));
+            }
+        }
+
+        private bool ShouldShowNum()
+        {
+            if (currentMode == "O") return false;
+            if (currentMode == "P" && IsNight()) return false;
+            return true;
+        }
+
+        private string GetPrefix()
+        {
+            if (currentMode == "P") return "MODE 3: Ban ngày· ";
+            return "AUTO  ·  ";
+        }
+
+        // ============================================================
+        //  DISCONNECT
+        // ============================================================
+        private void button_Disconnect_Click(object sender, EventArgs e)
+        {
+            isConnected = false;
+            try { server?.Close(); } catch { }
+            try { client?.Close(); } catch { }
+            DoDisconnect();
+        }
+
+        private void DoDisconnect()
+        {
+            if (InvokeRequired) { Invoke(new Action(DoDisconnect)); return; }
+
+            timeCLock.Stop();
+            currentMode = "";
+            lastDayNight = "";
+            isSending = false;
+
+            ldldata.Text = "Not connect";
+            ldldata.BackColor = Color.Red;
+            label_Mode.Text = "";
+
+            pictureBox_Light.Image = Properties.Resources.off_11;
+            pictureBox_Number.Image = null;
+          //  pictureBox_Number2.Image = null;
+
+            textBox_IP1.Enabled = textBox_IP2.Enabled = true;
+            textBox_IP3.Enabled = textBox_IP4.Enabled = true;
+            textBox_Port.Enabled = true;
+
+            SetUIConnected(false);
+        }
+
+        // ============================================================
+        //  HELPER: enable/disable controls
+        //  Form khong co groupBox_GUIMode -> thao tac tung control
+        // ============================================================
+        private void SetUIConnected(bool on)
+        {
+            button_Connect.Enabled = !on;
+            button_Disconnect.Enabled = on;
+
+            // Tat het control giao dien khi chua ket noi
+            SetControlsEnabled(false);
+
+            suppressEvt = true;
+            checkBox_GUI.Checked = false;
+            checkBox_Manual.Checked = false;
+            suppressEvt = false;
+        }
+
+        private void SetControlsEnabled(bool on)
+        {
+            // Nhom LED display
+            pictureBox_Light.Enabled = on;
+            pictureBox_Number.Enabled = on;
+
+            // Nhom control mode (chi mo khi chon GUI)
+            btn_B.Enabled = btn_O.Enabled = btn_P.Enabled = false;
+
+            // Nhom timing (chi mo khi chon GUI)
+            numRed.Enabled = false;
+            numYellow.Enabled = false;
+            numGreen.Enabled = false;
+            button1.Enabled = false;
+            button2.Enabled = false;
+
+            // Checkbox
+            checkBox_Manual.Enabled = on;
+            checkBox_GUI.Enabled = on;
+        }
+
+        // ============================================================
+        //  TIMER DONG HO
+        // ============================================================
+        private void timerAuto_Tick(object sender, EventArgs e)
+        {
+            label_Time.Text = DateTime.Now.ToString("HH:mm:ss  dd/MM/yyyy");
+        }
+
+        // ============================================================
+        //  TIMER MODE3 - kiem tra doi khung gio moi 5s
+        // ============================================================
+        private void timeCLock_Tick(object sender, EventArgs e)
+        {
+            if (currentMode != "P") { timeCLock.Stop(); return; }
+            if (isSending) return;
+            SendDayNight();
+        }
+
+        // ============================================================
+        //  DAY / NIGHT
+        // ============================================================
+        private bool IsNight()
+        {
+            int h = DateTime.Now.Hour;
+            return (h < 5 || h >= 22);
+        }
+
+        private void SendDayNight()
+        {
+            if (!isConnected || isSending) return;
+            string dn = IsNight() ? "N" : "D";
+            if (dn == lastDayNight) return;
+            lastDayNight = dn;
+            SendChar(dn[0]);
+            label_Mode.Text = dn == "D"
+                ? "MODE 3: Ban ngày (5h-22h)·AUTO"
+                : "MODE 3: Ban đêm (22h-5h)·Vàng nhấp nháy";
+            if (dn == "N") pictureBox_Number.Image = null;
+          //  pictureBox_Number2.Image = null;
+        }
+
+        // ============================================================
+        //  CHECKBOX GUI
+        // ============================================================
+        private void checkBox_GUI_CheckedChanged(object sender, EventArgs e)
+        {
+            if (suppressEvt || !checkBox_GUI.Checked) return;
+            suppressEvt = true;
+            checkBox_Manual.Checked = false;
+            suppressEvt = false;
+
+            // Mo nut MODE + timing
+            btn_B.Enabled = btn_O.Enabled = btn_P.Enabled = true;
+            numRed.Enabled = true;
+            numYellow.Enabled = true;
+            numGreen.Enabled = true;
+            button1.Enabled = true;
+            button2.Enabled = true;
+
+            lastDayNight = "";
+            timeCLock.Stop();
+
+            if (isConnected)
+            {
+                SendChar('G');           // PIC vao GUI mode
+                Thread.Sleep(30);
+                char m = string.IsNullOrEmpty(currentMode) ? 'A' : currentMode[0];
+                SendChar(m);
+                if (string.IsNullOrEmpty(currentMode)) currentMode = "A";
+            }
+
+            string ml = currentMode == "B" ? "Đỏ liên tục" :
+                        currentMode == "O" ? "Vàng nhấp nháy" :
+                        currentMode == "P" ? "Theo thời gian":"AUTO";
+            label_Mode.Text = "GUI MODE  ·  " + ml;
+            if (currentMode == "P") { SendDayNight(); timeCLock.Start(); }
+        }
+
+        // ============================================================
+        //  CHECKBOX MANUAL
+        // ============================================================
+        private void checkBox_Manual_CheckedChanged(object sender, EventArgs e)
+        {
+            if (suppressEvt || !checkBox_Manual.Checked) return;
+            suppressEvt = true;
+            checkBox_GUI.Checked = false;
+            suppressEvt = false;
+
+            // Khoa nut MODE + timing khi MANUAL
+            btn_B.Enabled = btn_O.Enabled = btn_P.Enabled = false;
+            numRed.Enabled = false;
+            numYellow.Enabled = false;
+            numGreen.Enabled = false;
+            button1.Enabled = false;
+            button2.Enabled = false;
+
+            timeCLock.Stop();
+            lastDayNight = "";
+            isSending = false;
+
+            if (isConnected) SendChar('M');
+            label_Mode.Text = "MANUAL MODE·Dùng nút vật lý";
+        }
+
+        // ============================================================
+        //  MODE BUTTONS (chi hoat dong khi GUI)
+        // ============================================================
+        private void btn_B_Click(object sender, EventArgs e)   // MODE1
+        {
+            if (!isConnected || currentMode == "B") return;
+            timeCLock.Stop(); currentMode = "B"; lastDayNight = "";
+            pictureBox_Light.Image = Properties.Resources.r1;
+            pictureBox_Number.Image = null;
+           // pictureBox_Number2.Image = null;
+            SendChar('B');
+            label_Mode.Text = "MODE 1  ·  Đỏ liên tục";
+        }
+
+        private void btn_O_Click(object sender, EventArgs e)   // MODE2
+        {
+            if (!isConnected || currentMode == "O") return;
+            timeCLock.Stop(); currentMode = "O"; lastDayNight = "";
+            pictureBox_Number.Image = null;
+            SendChar('O');
+            label_Mode.Text = "MODE 2  · Vàng nhấp nháy";
+        }
+
+        private void btn_P_Click(object sender, EventArgs e)   // MODE3
+        {
+            if (!isConnected || currentMode == "P") return;
+            timeCLock.Stop(); currentMode = "P"; lastDayNight = "";
+            SendChar('P');
+            Thread.Sleep(30);
+            SendDayNight();
+            timeCLock.Interval = 5000;
+            timeCLock.Start();
+            label_Mode.Text = "MODE 3  ·  Theo thời gian";
+        }
+
+        // ============================================================
+        //  APPLY TIMING (button1)
+        // ============================================================
+        private async void button1_Click(object sender, EventArgs e)
+        {
+            if (!isConnected) { MessageBox.Show("Chưa kết nối!"); return; }
+            if (!checkBox_GUI.Checked) { MessageBox.Show("Chọn GUI mode!"); return; }
+            if (isSending) { label_Mode.Text = "Đang gửi..."; return; }
+
+            byte r = (byte)numRed.Value;
+            byte y = (byte)numYellow.Value;
+            byte g = (byte)numGreen.Value;
+            string mode = string.IsNullOrEmpty(currentMode) ? "A" : currentMode;
+
+            button1.Enabled = false;
+            button2.Enabled = false;
+            label_Mode.Text = "Đang cài: R=" + r + "s Y=" + y + "s G=" + g + "s...";
+
+            await SendTiming(r, y, g, mode);
+
+            label_Mode.Text = "✔ R=" + r + "s  Y=" + y + "s  G=" + g + "s  [" + mode + "]";
+            button1.Enabled = true;
+            button2.Enabled = true;
+        }
+
+        // ============================================================
+        //  RESET TIMING (button2 / lblStatus)
+        // ============================================================
+        private async void button2_Click(object sender, EventArgs e)
+        {
+            if (!isConnected || isSending) return;
+
+            numRed.Value = 5; numYellow.Value = 3; numGreen.Value = 8;
+            timeCLock.Stop(); currentMode = "A"; lastDayNight = "";
+
+            button1.Enabled = false;
+            button2.Enabled = false;
+
+            await SendTiming(5, 3, 8, "A");
+
+            pictureBox_Light.Image = Properties.Resources.r1;
+            pictureBox_Number.Image = null;
+              //  pictureBox_Number2.Image = null;
+            label_Mode.Text = "✔ Reset: R=5s  Y=3s  G=8s  [AUTO]";
+            button1.Enabled = true;
+            button2.Enabled = true;
+        }
+
+        // ============================================================
+        //  FORM CLOSING
+        // ============================================================
+        private void Form1_FormClosing(object sender, FormClosingEventArgs e)
+        {
+            if (MessageBox.Show("Bạn có muốn thoát không?", "Xác nhận",
+                MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.No)
+            {
+                e.Cancel = true;
+                return;
+            }
+            isConnected = false;
+            try { server?.Close(); } catch { }
+            try { client?.Close(); } catch { }
+        }
+
+        // ============================================================
+        //  SHOW NUMBER
+        // ============================================================
+        private void ShowNumber(int n)
+        {
+            if (n < 0 || n > 9) { pictureBox_Number.Image = null;
+                //pictureBox1.Image = null; 
+
+              //  pictureBox_Number2.Image = null; return;
+            }
+            System.Drawing.Image[] imgs = {
+                Properties.Resources.khong, Properties.Resources.mot,
+                Properties.Resources.hai,   Properties.Resources.ba,
+                Properties.Resources.bon,   Properties.Resources.nam,
+                Properties.Resources.sau,   Properties.Resources.bay,
+                Properties.Resources.tam,   Properties.Resources.chin
+            };
+            pictureBox_Number.Image = imgs[n];
+            pictureBox_Number.Visible = true;
+            //pictureBox1.Image = imgs[n];
+           // pictureBox1.Visible = true; //led 7 doan
+            //   pictureBox_Number2.Image =imgs[n];
+            //  pictureBox_Number2.Visible = true;
+        }
+
+        // Stubs
+        private void groupBox_LED_Enter(object sender, EventArgs e) { }
+        private void label4_Click(object sender, EventArgs e) { }
+        private void label_Time_Click(object sender, EventArgs e) { }
+        private void label_Mode_Click(object sender, EventArgs e) { }
+        private void label6_Click(object sender, EventArgs e) { }
+        private void numericUpDown2_ValueChanged(object sender, EventArgs e) { }
+        private void groupBox1_Enter(object sender, EventArgs e) { }
+        private void numRed_ValueChanged(object sender, EventArgs e) { }
+        private void pictureBox_Number_Click(object sender, EventArgs e) { }
+        private void label3_Click(object sender, EventArgs e) { }
+        private void numGreen_ValueChanged(object sender, EventArgs e) { }
+        private void textBox2_TextChanged(object sender, EventArgs e) { }
+
+
+
+        private void textBox_Port_TextChanged(object sender, EventArgs e)
+        {
+
+        }
+
+        private void pictureBox_Number2_Click(object sender, EventArgs e)
+        {
+
+        }
+
+        private void label5_Click(object sender, EventArgs e)
+        {
+
+        }
+    }
+}
